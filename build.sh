@@ -433,6 +433,24 @@ update_feeds() {
 
 download_toolchain() {
     echo ""
+    # ── Precompiled toolchain is DISABLED by default ────────────────────────
+    # downloads.openwrt.org/snapshots ships a toolchain built from a DIFFERENT
+    # OpenWrt revision than the one pinned in OPENWRT_SHA. Its staging_dir
+    # directory name embeds the compiler version, e.g.
+    #   snapshot        : toolchain-aarch64_cortex-a53_gcc-14.4.0_musl
+    #   pinned a5c5ca06 : toolchain-aarch64_cortex-a53_gcc-14.3.0_musl
+    # OpenWrt only puts the name IT computes on PATH, so the copied-in gcc is
+    # unreachable: toolchain/compile is skipped (a gcc does exist under
+    # staging_dir/toolchain-aarch64_*) and the first compiler call dies with
+    #   ccache: error: Could not find compiler aarch64-openwrt-linux-musl-gcc
+    # That is exactly what Run #1 hit. Opt in with USE_PRECOMPILED_TOOLCHAIN=1
+    # only after verifying the snapshot gcc version equals CONFIG_GCC_VERSION.
+    if [ "${USE_PRECOMPILED_TOOLCHAIN:-0}" != "1" ]; then
+        echo "=== Precompiled toolchain disabled (USE_PRECOMPILED_TOOLCHAIN=1 to opt in) ==="
+        echo "    The toolchain will be built from source by make."
+        return 0
+    fi
+
     echo "=== Trying precompiled toolchain ==="
     TOOLCHAIN_URL="https://downloads.openwrt.org/snapshots/targets/${TARGET}/${SUBTARGET}/"
     TOOLCHAIN_FILE=$(curl -sL "$TOOLCHAIN_URL" 2>/dev/null | grep -oP 'openwrt-toolchain[^"]+tar\.zst' | head -1)
@@ -578,6 +596,30 @@ build_variants() {
             echo "This indicates unstable config - check for dependency conflicts."
             diff /tmp/.config-first-pass .config | head -30
             exit 1
+        fi
+
+        # 2.5 Validate any toolchain already present against THIS source tree.
+        # OpenWrt derives the toolchain dir name from CONFIG_ARCH, CONFIG_CPU_TYPE
+        # and CONFIG_GCC_VERSION (toolchain-<arch>_<cpu>_gcc-<ver>_<libc>) and puts
+        # only that name on PATH. A toolchain copied in by download_toolchain() may
+        # carry a different compiler version; then gcc is unreachable and the build
+        # dies with 'ccache: error: Could not find compiler'. Remove any mismatching
+        # directory so the full make below rebuilds the toolchain correctly.
+        CFG_GCC=$(sed -n 's/^CONFIG_GCC_VERSION="\(.*\)"$/\1/p' .config | head -1)
+        CFG_ARCH=$(sed -n 's/^CONFIG_ARCH="\(.*\)"$/\1/p' .config | head -1)
+        CFG_CPU=$(sed -n 's/^CONFIG_CPU_TYPE="\(.*\)"$/\1/p' .config | head -1)
+        if [ -n "$CFG_GCC" ] && [ -n "$CFG_ARCH" ] && [ -n "$CFG_CPU" ]; then
+            EXPECT_TC="toolchain-${CFG_ARCH}_${CFG_CPU}_gcc-${CFG_GCC}_musl"
+            echo "--- Source tree expects toolchain: $EXPECT_TC ---"
+            for tc_dir in staging_dir/toolchain-*; do
+                [ -d "$tc_dir" ] || continue
+                if [ "$(basename "$tc_dir")" != "$EXPECT_TC" ]; then
+                    echo "::warning::Mismatched toolchain $(basename "$tc_dir") (expected $EXPECT_TC); removing it and rebuilding from source"
+                    rm -rf "$tc_dir"
+                fi
+            done
+        else
+            echo "--- Could not derive expected toolchain dir from .config, skipping check ---"
         fi
 
         # 3. Download sources
